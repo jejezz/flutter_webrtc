@@ -83,10 +83,67 @@ NSArray<RTC_OBJC_TYPE(RTCVideoCodecInfo) *>* motifyH264ProfileLevelId(
 }
 @end
 
+// RTCDefaultVideoDecoderFactory 는 Constrained Baseline / Constrained High 만 광고한다.
+// VideoToolbox 는 Baseline · Main · High 도 디코딩하므로, SDP 에 없는 프로파일을
+// 뒤에 덧붙인다. 기존 항목은 순서째 그대로 둔다 — 지금까지 붙던 상대는 같은 값으로
+// 붙어야 한다. (Android 의 withReportedH264Profiles / withPacketizationModeZero 와
+// 같은 일이다.)
+//
+// level 은 5.1 로 둔다. libwebrtc 의 H264Level 은 5.2 에서 끝나고, 그 위는 파싱이
+// 실패해 항목 전체가 무효가 된다.
+static NSString* H264ProfilePrefix(NSString* hexString) {
+  return hexString.length >= 4 ? [[hexString substringToIndex:4] lowercaseString] : @"";
+}
+
+static NSArray<RTC_OBJC_TYPE(RTCVideoCodecInfo) *>* withExtraH264Profiles(
+    NSArray<RTC_OBJC_TYPE(RTCVideoCodecInfo) *>* codecs) {
+  NSMutableArray* result = [NSMutableArray arrayWithArray:codecs];
+  RTC_OBJC_TYPE(RTCVideoCodecInfo)* base = nil;
+  NSMutableSet<NSString*>* have = [NSMutableSet set];
+  for (RTC_OBJC_TYPE(RTCVideoCodecInfo)* info in codecs) {
+    if (![info.name isEqualToString:kRTCVideoCodecH264Name]) continue;
+    if (base == nil) base = info;
+    NSString* prefix = H264ProfilePrefix(info.parameters[@"profile-level-id"]);
+    NSString* mode = info.parameters[@"packetization-mode"] ?: @"1";
+    [have addObject:[prefix stringByAppendingString:mode]];
+  }
+  // H.264 디코더가 없으면 아무것도 덧붙이지 않는다. 못 푸는 것을 광고하면 협상은
+  // 붙고 화면만 검어진다.
+  if (base == nil) return codecs;
+
+  const RTCH264Profile profiles[] = {
+      RTCH264ProfileConstrainedBaseline, RTCH264ProfileBaseline,
+      RTCH264ProfileMain,                RTCH264ProfileConstrainedHigh,
+      RTCH264ProfileHigh,
+  };
+  for (size_t i = 0; i < sizeof(profiles) / sizeof(profiles[0]); i++) {
+    RTCH264ProfileLevelId* levelId =
+        [[RTCH264ProfileLevelId alloc] initWithProfile:profiles[i] level:RTCH264Level5_1];
+    NSString* hex = [levelId hexString];
+    NSString* prefix = H264ProfilePrefix(hex);
+    BOOL baselineFamily = profiles[i] == RTCH264ProfileConstrainedBaseline ||
+                          profiles[i] == RTCH264ProfileBaseline;
+    // packetization-mode 0 은 Baseline 계열에만. depacketizer 는 이 값을 읽지 않고
+    // NAL 타입으로 판단하므로 mode 0 스트림도 같은 코드로 풀린다.
+    NSArray<NSString*>* modes = baselineFamily ? @[ @"1", @"0" ] : @[ @"1" ];
+    for (NSString* mode in modes) {
+      NSString* key = [prefix stringByAppendingString:mode];
+      if ([have containsObject:key]) continue;
+      [have addObject:key];
+      NSMutableDictionary* params = [NSMutableDictionary dictionaryWithDictionary:base.parameters];
+      params[@"profile-level-id"] = hex;
+      params[@"packetization-mode"] = mode;
+      [result addObject:[[RTCVideoCodecInfo alloc] initWithName:kRTCVideoCodecH264Name
+                                                     parameters:params]];
+    }
+  }
+  return result;
+}
+
 @implementation VideoDecoderFactory
 - (NSArray<RTC_OBJC_TYPE(RTCVideoCodecInfo) *>*)supportedCodecs {
   NSArray<RTC_OBJC_TYPE(RTCVideoCodecInfo)*>* codecs = [super supportedCodecs];
-  return motifyH264ProfileLevelId(codecs);
+  return withExtraH264Profiles(motifyH264ProfileLevelId(codecs));
 }
 @end
 
